@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.kirkconsulting.orthocontrol</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/jkp/Development/opensource/orthocontrol/.direnv/python-3.12/bin/python</string>
+        <string>/Users/jkp/Development/opensource/orthocontrol/orthocontrol.py</string>
+        <string>--midi-name</string>
+        <string>ortho remote Bluetooth</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/com.kirkconsulting.orthocontrol.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/com.kirkconsulting.orthocontrol-error.log</string>
+</dict>
+</plist>
