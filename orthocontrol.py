@@ -94,7 +94,7 @@ def set_application_volume(app_name, volume):
     except subprocess.CalledProcessError:
         logging.error(f"Failed to set {app_name} volume.")
 
-@throttle_debounce(throttle_ms=250, debounce_ms=100)
+@throttle_debounce(throttle_ms=200, debounce_ms=30)
 def set_volume(volume):
     logging.debug(f"Setting volume to {volume}%.")
     set_application_volume("Music", volume)
