@@ -1,3 +1,4 @@
+import psutil
 import sys
 import subprocess
 import getopt
@@ -76,9 +77,22 @@ def throttle_debounce(throttle_ms, debounce_ms):
         return wrapper
     return decorator
 
+def is_process_running(app_name):
+    """Check if there is any running process that contains the given name app_name."""
+    for process in psutil.process_iter(['name']):
+        if app_name.lower() in process.info['name'].lower():
+            return True
+    return False
+
 def set_application_volume(app_name, volume):
     if not 0 <= volume <= 100:
         raise ValueError("Volume must be between 0 and 100.")
+
+    # Early exit if the application is not running
+    if not is_process_running(app_name):
+        logging.debug(f"{app_name} is not running.")
+        return
+
     script = f"""
     tell application "System Events"
         if exists (application process "{app_name}") then
