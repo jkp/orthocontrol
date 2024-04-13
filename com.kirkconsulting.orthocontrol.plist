@@ -8,6 +8,8 @@
     <array>
         <string>/Users/jkp/Development/opensource/orthocontrol/.direnv/python-3.12/bin/python</string>
         <string>/Users/jkp/Development/opensource/orthocontrol/orthocontrol.py</string>
+        <string>--midi-notifications</string>
+        <string>--midi-restart</string>
         <string>--midi-name</string>
         <string>ortho remote Bluetooth</string>
     </array>
