@@ -110,7 +110,7 @@ def set_application_volume(app_name, volume):
 
 @throttle_debounce(throttle_ms=200, debounce_ms=30)
 def set_volume(volume):
-    logging.debug(f"Setting volume to {volume}%.")
+    logging.info(f"Setting volume to {volume}%.")
     set_application_volume("Music", volume)
     set_application_volume("Spotify", volume)
 
@@ -121,7 +121,7 @@ def tap(code, flags=0):
     CGEventPost(kCGHIDEventTap, event.CGEvent())
 
 def toggle_play_pause():
-    logging.debug("Toggling play/pause")
+    logging.info("Toggling play/pause")
     tap(CODE_PLAY)
 
 def midi_callback(message, time_stamp):
