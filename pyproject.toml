@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orthocontrol"
+version = "0.1.0"
+description = "Bridge for the Teenage Engineering Ortho Remote"
+authors = [
+    { name = "Jamie Kirkpatrick", email = "jkp@kirkconsuting.co.uk" }
+]
+dependencies = [
+    "pyobjc==11.0",
+    "python-rtmidi==1.5.8",
+    "psutil==7.0.0",
+]
