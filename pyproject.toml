@@ -13,4 +13,6 @@ dependencies = [
     "pyobjc==11.0",
     "python-rtmidi==1.5.8",
     "psutil==7.0.0",
+    "spotipy>=2.25.1",
+    "python-dotenv>=1.1.0",
 ]
