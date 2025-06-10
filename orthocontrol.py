@@ -5,7 +5,8 @@ import getopt
 import rtmidi # type: ignore[reportMissingModuleSource]
 import time
 from functools import wraps, partial
-from threading import Timer
+from threading import Timer, Thread, Lock, Event
+import threading
 from typing import Callable, TypeVar, Any
 from Quartz.CoreGraphics import CGEventPost, kCGHIDEventTap
 from AppKit import NSEvent
@@ -26,6 +27,12 @@ is_latched: bool = False
 
 # Global Spotify Client
 sp: "spotipy.Spotify | None" = None
+
+# Volume sync thread variables
+target_volume: int | None = None
+target_volume_lock = Lock()
+volume_sync_thread: Thread | None = None
+stop_sync_thread = False
 
 def setup_logging(level='info'):
     level_dict = {
@@ -63,16 +70,35 @@ def process_command_line_args():
         logging.error(f"Command line error: {e}")
         sys.exit(1)
 
-def throttle_debounce(throttle_ms: int, debounce_ms: int, first_call_threshold_ms: int = 500) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    throttle_interval = throttle_ms / 1000.0
+def throttle_debounce(throttle_ms: int, debounce_ms: int, first_call_threshold_ms: int = 500, 
+                  initial_throttle_ms: int = 50, max_throttle_ms: int = 500, 
+                  backoff_factor: float = 1.5) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Decorator that combines throttling and debouncing with a special case for the first call and backoff.
+    
+    Args:
+        throttle_ms: Base throttle time between executions in milliseconds (used as a reference)
+        debounce_ms: Time to wait after last call before executing in milliseconds
+        first_call_threshold_ms: Time threshold in ms to consider a call as the first in a new interaction
+        initial_throttle_ms: Starting throttle time for a new interaction sequence in milliseconds
+        max_throttle_ms: Maximum throttle time to reach with backoff in milliseconds
+        backoff_factor: Multiplier for increasing throttle time with each call
+        
+    Returns:
+        Decorated function with throttling, debouncing, and backoff behavior
+    """
+    # Convert to seconds for internal use
     debounce_interval = debounce_ms / 1000.0
     first_call_interval_threshold = first_call_threshold_ms / 1000.0
+    initial_throttle_interval = initial_throttle_ms / 1000.0
+    max_throttle_interval = max_throttle_ms / 1000.0
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         last_call_time: list[float] = [0.0]  # Time of the last throttled execution
         # Time of the last actual execution (either throttled or debounced), marks end of an interaction sequence
         last_interaction_end_time: list[float] = [0.0]
         debounce_timer: list[Timer | None] = [None]
+        # Track the current throttle interval with backoff
+        current_throttle_interval: list[float] = [initial_throttle_interval]
 
         @wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> None:
@@ -85,19 +111,28 @@ def throttle_debounce(throttle_ms: int, debounce_ms: int, first_call_threshold_m
             is_new_interaction = (now - last_interaction_end_time[0]) > first_call_interval_threshold
 
             if is_new_interaction:
-                # First call in a new interaction sequence: execute immediately
+                # First call in a new interaction sequence: execute immediately and reset throttle interval
                 logging.debug(f"throttle_debounce: New interaction - immediate call for {getattr(func, '__name__', 'decorated_function')}")
+                # Reset throttle interval to initial value for new interaction
+                current_throttle_interval[0] = initial_throttle_interval
+                logging.debug(f"throttle_debounce: Reset throttle interval to {current_throttle_interval[0]*1000:.1f}ms")
                 func(*args, **kwargs)
                 last_call_time[0] = now
                 last_interaction_end_time[0] = now
             else:
-                # Subsequent call in an ongoing interaction: apply throttle/debounce
-                if now - last_call_time[0] > throttle_interval:
-                    # Throttle condition met: execute immediately
-                    logging.debug(f"throttle_debounce: Throttled call for {getattr(func, '__name__', 'decorated_function')}")
+                # Subsequent call in an ongoing interaction: apply throttle/debounce with backoff
+                if now - last_call_time[0] > current_throttle_interval[0]:
+                    # Throttle condition met: execute immediately and increase throttle interval
+                    logging.debug(f"throttle_debounce: Throttled call for {getattr(func, '__name__', 'decorated_function')} at {current_throttle_interval[0]*1000:.1f}ms")
                     func(*args, **kwargs)
                     last_call_time[0] = now
                     last_interaction_end_time[0] = now
+                    
+                    # Apply backoff to throttle interval for next call
+                    new_throttle = min(current_throttle_interval[0] * backoff_factor, max_throttle_interval)
+                    if new_throttle != current_throttle_interval[0]:
+                        logging.debug(f"throttle_debounce: Increasing throttle interval from {current_throttle_interval[0]*1000:.1f}ms to {new_throttle*1000:.1f}ms")
+                        current_throttle_interval[0] = new_throttle
                 else:
                     # Throttle condition not met: set up debounce
                     def call_it_debounced():
@@ -266,53 +301,14 @@ def set_spotify_volume_api(volume_percent: int) -> bool:
         logging.error(f"Unexpected error setting Spotify volume via API: {e}")
         return False
 
-@throttle_debounce(throttle_ms=100, debounce_ms=200, first_call_threshold_ms=500) # Adjusted debounce for Spotify
 def set_volume(volume_percentage: int):
-    """Sets the volume for target applications, trying Spotify API first, then AppleScript.
-    This function is debounced to prevent flooding commands.
-    """
-    global sp, actual_app_volume_on_connect, is_latched # Added globals for clarity
-
-    logging.info(f"Received request to set volume to {volume_percentage}%. Latch state: {is_latched}")
-
-    if not is_latched:
-        if actual_app_volume_on_connect is not None:
-            # Check if the current remote value is close enough to latch
-            # We use volume_percentage here as it's the current remote value
-            if abs(volume_percentage - actual_app_volume_on_connect) <= LATCH_TOLERANCE_PERCENT:
-                logging.info(f"Remote value {volume_percentage}% is now latched to app volume {actual_app_volume_on_connect}%.")
-                is_latched = True
-                # Proceed to set volume now that it's latched
-            else:
-                logging.debug(
-                    f"Waiting to latch: Remote at {volume_percentage}%, App was {actual_app_volume_on_connect}%. Difference {abs(volume_percentage - actual_app_volume_on_connect)}% > {LATCH_TOLERANCE_PERCENT}%"
-                )
-                return # Don't set volume until latched
-        else:
-            # No initial app volume, so latch immediately (or consider this an error/edge case)
-            logging.warning("No initial app volume recorded; latching immediately. This might be unexpected.")
-            is_latched = True
+    """Simply updates the target volume. Worker thread handles syncing."""
+    global target_volume
     
-    # If we are here, either we were already latched, or just became latched.
-    logging.debug(f"Processing volume set to {volume_percentage}% (Latched: {is_latched}).")
-
-    spotify_controlled_by_api = False
-    if sp: # If Spotify client is initialized, try API first
-        if set_spotify_volume_api(volume_percentage):
-            spotify_controlled_by_api = True
-            # Debug log is in set_spotify_volume_api
-        else:
-            logging.warning("Spotify API volume control failed. Will attempt AppleScript for Spotify.")
-    
-    # Fallback or control for Music app / or if Spotify API failed
-    if not spotify_controlled_by_api:
-        # If Spotify API failed or sp client not init, try AppleScript for Spotify
-        logging.debug("Attempting to set Spotify volume via AppleScript.")
-        set_application_volume("Spotify", volume_percentage) 
-    
-    # Always control Music app via AppleScript (if it's running)
-    logging.debug("Attempting to set Music app volume via AppleScript.")
-    set_application_volume("Music", volume_percentage)
+    with target_volume_lock:
+        if target_volume != volume_percentage:
+            logging.debug(f"Target volume: {volume_percentage}%")
+        target_volume = volume_percentage
 
 
 def tap(code: int, flags: int = 0):
@@ -334,16 +330,70 @@ def toggle_play_pause():
     tap(CODE_PLAY)
 
 
+def volume_sync_worker():
+    """Simple fixed-rate sync with rate limit protection."""
+    global target_volume, stop_sync_thread, sp
+    
+    last_synced_volume = None
+    last_sync_time = 0
+    rate_limited_until = 0
+    
+    SYNC_INTERVAL = 0.25  # 250ms = 4 updates/second max
+    RATE_LIMIT_BACKOFF = 10.0  # 10 seconds when rate limited
+    
+    logging.info("Volume sync worker started (250ms interval)")
+    
+    while not stop_sync_thread:
+        try:
+            time.sleep(0.05)  # Small sleep to prevent CPU spinning
+            now = time.time()
+            
+            # Skip if rate limited
+            if now < rate_limited_until:
+                continue
+            
+            # Skip if too soon since last sync
+            if now - last_sync_time < SYNC_INTERVAL:
+                continue
+            
+            # Get current target
+            with target_volume_lock:
+                current_target = target_volume
+            
+            # Sync if changed
+            if current_target is not None and current_target != last_synced_volume:
+                logging.info(f"Syncing volume: {last_synced_volume}% → {current_target}%")
+                
+                try:
+                    if sp and set_spotify_volume_api(current_target):
+                        last_synced_volume = current_target
+                        last_sync_time = now
+                except SpotifyException as e:
+                    if hasattr(e, 'http_status') and e.http_status == 429:
+                        logging.warning(f"RATE LIMITED! Backing off for {RATE_LIMIT_BACKOFF} seconds")
+                        rate_limited_until = now + RATE_LIMIT_BACKOFF
+                    else:
+                        logging.error(f"Spotify error: {e}")
+                except Exception as e:
+                    logging.error(f"Unexpected error: {e}")
+            
+        except Exception as e:
+            logging.error(f"Worker error: {e}")
+            time.sleep(1.0)
+    
+    logging.info("Volume sync worker stopped")
+
+
 def midi_callback(message: tuple[list[int], float], _time_stamp: float, sysex_enabled: bool = False, log_level: str = 'info'):
-    """Process MIDI messages to control volume and playback."""
-    # Example MIDI message: (([176, 7, 64], 0.00011909008026123047))
+    """Process MIDI messages instantly - no throttling here!"""
     global is_latched, actual_app_volume_on_connect, LATCH_TOLERANCE_PERCENT
 
+    logging.debug(f"MIDI message received: {message}")
     message_type, note, velocity = message[0]
 
     if sysex_enabled:
         logging.info(f"MIDI Raw (SYSEX Mode): Type={message_type}, Note={note}, Velocity={velocity}")
-    elif log_level == 'debug': # Log raw if log_level is debug and not in sysex (to avoid double logging)
+    elif log_level == 'debug':
         logging.debug(f"MIDI Raw: Type={message_type}, Note={note}, Velocity={velocity}")
 
     if message_type == 176:  # CC message
@@ -357,19 +407,19 @@ def midi_callback(message: tuple[list[int], float], _time_stamp: float, sysex_en
                     set_volume(remote_value_percent)
                 else:
                     logging.debug(
-                        f"Waiting for latch: Remote at {remote_value_percent}%, App at {actual_app_volume_on_connect}%. Turn knob to match app volume. Difference {abs(remote_value_percent - actual_app_volume_on_connect)}% > {LATCH_TOLERANCE_PERCENT}%"
+                        f"Waiting for latch: Remote at {remote_value_percent}%, App at {actual_app_volume_on_connect}%. "
+                        f"Difference {abs(remote_value_percent - actual_app_volume_on_connect)}% > {LATCH_TOLERANCE_PERCENT}%"
                     )
             else:
-                # No initial app volume, latch immediately with the first remote value
+                # No initial app volume, latch immediately
                 is_latched = True
                 logging.info(f"No initial app volume. Remote latched immediately at {remote_value_percent}%. Control engaged.")
                 set_volume(remote_value_percent)
-        else:  # is_latched is True
+        else:
+            # Already latched - just update the target instantly!
             set_volume(remote_value_percent)
-            logging.debug(f"Volume adjusted to {remote_value_percent}% (latched).")
 
     elif message_type == 144:  # Note On message
-        # Check if the note matches CODE_PLAY
         toggle_play_pause()
         logging.debug(f"Play/Pause toggled based on MIDI note {note}.")
 
@@ -395,7 +445,8 @@ def main():
             # redirect_uri=os.getenv('SPOTIPY_REDIRECT_URI'),
             open_browser=True, # Set to True to re-enable automatic browser opening
         )
-        sp = spotipy.Spotify(auth_manager=auth_manager)
+        # Disable automatic retries to handle rate limits ourselves
+        sp = spotipy.Spotify(auth_manager=auth_manager, retries=0)
 
         # Test if authentication was successful by making a simple API call
         try:
@@ -481,7 +532,14 @@ def main():
                     # Prepare callback with current sysex_enable status and log_level
                     callback_with_context = partial(midi_callback, sysex_enabled=sysex_enabled, log_level=current_log_level)
                     midi_in.set_callback(callback_with_context)
-                    logging.info(f"'{port_name}' opened successfully. Waiting for MIDI data...")
+                    logging.info(f"'{port_name}' opened successfully. Callback set. Waiting for MIDI data...")
+                    logging.info("Turn the knob on your Ortho Remote to test the connection.")
+                    
+                    # Start the volume sync worker thread
+                    global volume_sync_thread, stop_sync_thread
+                    stop_sync_thread = False
+                    volume_sync_thread = Thread(target=volume_sync_worker, daemon=True)
+                    volume_sync_thread.start()
                     
                     # Log initial volumes
                     _ = get_application_volume("Music")
@@ -489,6 +547,12 @@ def main():
 
                     while port_name in midi_in.get_ports() and port_name in midi_out.get_ports():
                         time.sleep(restart_interval)
+                    
+                    # Stop the sync thread when MIDI disconnects
+                    stop_sync_thread = True
+                    if volume_sync_thread:
+                        volume_sync_thread.join(timeout=1.0)
+                    
                     midi_in.cancel_callback()
             except Exception as e:
                 logging.error(f"Error with MIDI port {port_name}: {str(e)}")
